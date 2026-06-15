@@ -10,6 +10,10 @@ from typing import Dict, List, Optional, Any
 
 logger = logging.getLogger(__name__)
 
+# Isolated RNG for Thompson sampling — avoids correlated draws
+# from NumPy's global random state under concurrent load.
+_rng = np.random.RandomState(random.getrandbits(128))
+
 
 class TestStatus(Enum):
     SETUP = "setup"
@@ -67,11 +71,52 @@ class Arm:
             self.successes += 1
         else:
             self.failures += 1
+    
+    def record_trial(self, success: bool, mae: float = 0.0, rmse: float = 0.0, latency: float = 0.0):
+        """Record outcome and prediction metrics atomically so counters never drift."""
+        self.total_trials += 1
+        if success:
+            self.successes += 1
+        else:
+            self.failures += 1
+        self.predictions += 1
+        self.mae_sum += mae
+        self.rmse_sum += rmse
+        self.latency_sum += latency
+        self.latency_count += 1
+    
+    def sample_from_distribution(self) -> float:
+        """Sample success probability from Beta distribution (Thompson sampling)"""
+        # Use Beta(alpha, beta) where alpha = successes, beta = failures
+        alpha = self.successes + 1  # Add pseudocount
+        beta = self.failures + 1
+        
+        if alpha <= 0 or beta <= 0:
+            return 0.5
+        
+        # Sample from Beta distribution using isolated RNG
+        return _rng.beta(alpha, beta)
+    
+    def confidence_interval(self, alpha: float = 0.05) -> Dict[str, float]:
+        """
+        Compute a Wald confidence (credible) interval for the arm's success
+        probability using the Beta posterior Beta(alpha+1, beta+1). Falls
+        back to a normal approximation for large n.
+        """
+        n = self.successes + self.failures
+        if n == 0:
+            return {"lower": 0.0, "upper": 0.0, "mean": 0.0}
+        p = self.successes / n
+        z = 1.96  # approximates alpha=0.05 two-tailed
+        se = math.sqrt(p * (1 - p) / n) if n > 0 else 0.0
+        return {
+            "lower": max(0.0, p - z * se),
+            "upper": min(1.0, p + z * se),
+            "mean": p,
+        }
 
-    def sample_score(self) -> float:
-        return random.betavariate(self.alpha, self.beta)
-
-    def to_dict(self) -> Dict[str, Any]:
+    def to_dict(self) -> Dict:
+        """Convert to dictionary"""
         return {
             "model_id": self.model_id,
             "model_version": self.model_version,
@@ -79,6 +124,7 @@ class Arm:
             "successes": self.successes,
             "failures": self.failures,
             "total_trials": self.total_trials,
+            "confidence_interval": self.confidence_interval(),
             "predictions": self.predictions,
             "mae": self.mean_mae,
             "rmse": self.mean_rmse,
@@ -131,9 +177,14 @@ class ABTest:
         """Record outcome for an arm"""
         arm = self.control_arm if arm_id == self.control_arm.model_id else self.variant_arm
         
-        arm.record_outcome(success)
-        if {"mae", "rmse", "latency"}.issubset(metrics):
-            arm.record_prediction(metrics["mae"], metrics["rmse"], metrics["latency"])
+        arm.record_trial(
+            success,
+            mae=metrics.get("mae", 0.0),
+            rmse=metrics.get("rmse", 0.0),
+            latency=metrics.get("latency", 0.0),
+        )
+        
+        # Update allocation based on Thompson sampling
         self._update_allocation()
     
     def _update_allocation(self):
@@ -176,34 +227,23 @@ class ABTest:
         return float(np.mean(variant_samples > control_samples))
 
     def get_winner(self) -> Optional[Arm]:
-        """Determine winner via two-proportion z-test."""
+        """Determine winner using the configured confidence threshold."""
         total_trials = self.control_arm.total_trials + self.variant_arm.total_trials
+
         if total_trials < self.min_samples:
             return None
 
-        n_c = self.control_arm.total_trials
-        n_v = self.variant_arm.total_trials
-        s_c = self.control_arm.successes
-        s_v = self.variant_arm.successes
+        c_ci = self.control_arm.confidence_interval()
+        v_ci = self.variant_arm.confidence_interval()
 
-        p_c = s_c / max(n_c, 1)
-        p_v = s_v / max(n_v, 1)
+        # Winner is declared when the lower bound of the superior arm's
+        # credible interval exceeds the upper bound of the other arm,
+        # i.e. the intervals do not overlap at the configured level.
+        if v_ci["lower"] > c_ci["upper"]:
+            return self.variant_arm
+        if c_ci["lower"] > v_ci["upper"]:
+            return self.control_arm
 
-        # Pooled proportion under null hypothesis
-        p_pool = (s_c + s_v) / max(total_trials, 1)
-
-        # Standard error of the difference
-        se = math.sqrt(p_pool * (1 - p_pool) * (1 / max(n_c, 1) + 1 / max(n_v, 1)))
-        if se == 0:
-            return None
-
-        z = (p_c - p_v) / se
-        # Two-tailed p-value via complementary error function
-        p_value = math.erfc(abs(z) / math.sqrt(2))
-
-        alpha = 1.0 - self.confidence_threshold
-        if p_value < alpha:
-            return self.variant_arm if p_v > p_c else self.control_arm
         return None
 
     def end(self) -> None:
